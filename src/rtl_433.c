@@ -38,6 +38,7 @@ time_t rawtime_old;
 int duration = 0;
 time_t stop_time;
 int flag;
+int stop_after_successful_events_flag = 0;
 uint32_t samp_rate = DEFAULT_SAMPLE_RATE;
 float sample_file_pos = -1;
 static uint32_t bytes_to_read = 0;
@@ -49,6 +50,9 @@ int debug_output = 0;
 int quiet_mode = 0;
 int utc_mode = 0;
 int overwrite_mode = 0;
+int have_opt_i = 0;
+char *dev_serial_number;
+int device_specified = 0;
 
 typedef enum  {
     CONVERT_NATIVE,
@@ -57,7 +61,7 @@ typedef enum  {
 } conversion_mode_t;
 static conversion_mode_t conversion_mode = CONVERT_NATIVE;
 
-int num_r_devices = 0;
+uint16_t num_r_devices = 0;
 
 struct dm_state {
     FILE *out_file;
@@ -84,7 +88,7 @@ struct dm_state {
 
 
     /* Protocol states */
-    int r_dev_num;
+    uint16_t r_dev_num;
     struct protocol_state *r_devs[MAX_PROTOCOLS];
 
     pulse_data_t    pulse_data;
@@ -99,6 +103,7 @@ void usage(r_device *devices) {
             "rtl_433, an ISM band generic data receiver for RTL2832 based DVB-T receivers\n\n"
             "Usage:\t= Tuner options =\n"
             "\t[-d <RTL-SDR USB device index>] (default: 0)\n"
+            "\t[-i <RTL-SDR USB device serial number (can be set with rtl_eeprom -s)>]\n"
             "\t[-g <gain>] (default: 0 for auto)\n"
             "\t[-f <frequency>] [-f...] Receive frequency(s) (default: %i Hz)\n"
             "\t[-H <seconds>] Hop interval for polling of multiple frequencies (default: %i seconds)\n"
@@ -135,16 +140,13 @@ void usage(r_device *devices) {
             "\t[-C] native|si|customary Convert units in decoded output.\n"
             "\t[-T] specify number of seconds to run\n"
             "\t[-U] Print timestamps in UTC (this may also be accomplished by invocation with TZ environment variable set).\n"
+            "\t[-E] Stop after outputting successful event(s)\n"
             "\t[<filename>] Save data stream to output file (a '-' dumps samples to stdout)\n\n",
             DEFAULT_FREQUENCY, DEFAULT_HOP_TIME, DEFAULT_SAMPLE_RATE, DEFAULT_LEVEL_LIMIT);
 
     fprintf(stderr, "Supported device protocols:\n");
     for (i = 0; i < num_r_devices; i++) {
-    if (devices[i].disabled)
-        disabledc = '*';
-    else
-        disabledc = ' ';
-
+        disabledc = devices[i].disabled ? '*' : ' ';
         fprintf(stderr, "    [%02d]%c %s\n", i + 1, disabledc, devices[i].name);
     }
     fprintf(stderr, "\n* Disabled by default, use -R n or -G\n");
@@ -185,6 +187,10 @@ static void register_protocol(struct dm_state *demod, r_device *t_dev) {
     p->callback = t_dev->json_callback;
     p->name = t_dev->name;
     p->demod_arg = t_dev->demod_arg;
+    if (p->modulation == OOK_PULSE_PWM_PRECISE) {
+        PWM_Precise_Parameters *pwm_precise_parameters = (PWM_Precise_Parameters *)p->demod_arg;
+        pwm_precise_parameters->pulse_tolerance = (float)pwm_precise_parameters->pulse_tolerance / ((float)1000000 / (float)samp_rate);
+    }
     bitbuffer_clear(&p->bits);
 
     demod->r_devs[demod->r_dev_num] = p;
@@ -647,8 +653,8 @@ static void rtlsdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx) {
     } else {
         // Detect a package and loop through demodulators with pulse data
         int package_type = 1;  // Just to get us started
+        int p_events = 0;  // Sensor events successfully detected per package
         while(package_type) {
-            int p_events = 0;  // Sensor events successfully detected per package
             package_type = pulse_detect_package(demod->am_buf, demod->fm_buf, len/2, demod->level_limit, samp_rate, &demod->pulse_data, &demod->fsk_pulse_data);
             if (package_type == 1) {
                 if(demod->analyze_pulses) fprintf(stderr, "Detected OOK package\t@ %s\n", local_time_str(0, time_str));
@@ -726,6 +732,11 @@ static void rtlsdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx) {
                 }
             } // if (package_type == ...
         } // while(package_type)...
+
+        if (stop_after_successful_events_flag && (p_events > 0)) {
+            do_exit = do_exit_async = 1;
+            rtlsdr_cancel_async(dev);
+        }
     } // if (demod->analyze...
 
     if (demod->out_file) {
@@ -744,8 +755,8 @@ static void rtlsdr_callback(unsigned char *iq_buf, uint32_t len, void *ctx) {
     if (bytes_to_read > 0)
         bytes_to_read -= len;
 
-        time_t rawtime;
-        time(&rawtime);
+    time_t rawtime;
+    time(&rawtime);
 	if (frequencies > 1 && difftime(rawtime, rawtime_old) > demod->hop_time) {
 	  rawtime_old = rawtime;
 	  do_exit_async = 1;
@@ -875,14 +886,16 @@ int main(int argc, char **argv) {
     FILE *in_file;
     int n_read;
     int r = 0, opt;
-    int i, gain = 0;
+    int gain = 0;
+    uint32_t i = 0;
     int sync_mode = 0;
     int ppm_error = 0;
     struct dm_state* demod;
-    uint32_t dev_index = 0;
+    int dev_index = 0;
+    int have_opt_d = 0;
     int frequency_current = 0;
     uint32_t out_block_size = DEFAULT_BUF_LENGTH;
-    int device_count;
+    uint16_t device_count;
     char vendor[256], product[256], serial[256];
     int have_opt_R = 0;
     int register_all = 0;
@@ -907,10 +920,15 @@ int main(int argc, char **argv) {
     demod->level_limit = DEFAULT_LEVEL_LIMIT;
     demod->hop_time = DEFAULT_HOP_TIME;
 
-    while ((opt = getopt(argc, argv, "x:z:p:DtaAI:qm:r:l:d:f:H:g:s:b:n:SR:F:C:T:UWGy:")) != -1) {
+    while ((opt = getopt(argc, argv, "x:z:p:DtaAI:qm:r:l:d:i:f:H:g:s:b:n:SR:F:C:T:UWGy:E")) != -1) {
         switch (opt) {
             case 'd':
                 dev_index = atoi(optarg);
+                have_opt_d = device_specified = dev_index > -1;
+                break;
+            case 'i':
+                have_opt_i = device_specified = 1;
+                dev_serial_number = optarg;
                 break;
             case 'f':
                 if (frequencies < MAX_PROTOCOLS) frequency[frequencies++] = (uint32_t) atof(optarg);
@@ -918,7 +936,7 @@ int main(int argc, char **argv) {
                 break;
             case 'H':
                 demod->hop_time = atoi(optarg);
-		break;
+                break;
             case 'g':
                 gain = (int) (atof(optarg) * 10); /* tenths of a dB */
                 break;
@@ -986,53 +1004,56 @@ int main(int argc, char **argv) {
 
                 devices[i - 1].disabled = 0;
                 break;
-         case 'q':
-            quiet_mode = 1;
-        break;
-        case 'F':
-        if (strncmp(optarg, "json", 4) == 0) {
-            add_json_output(arg_param(optarg));
-        } else if (strncmp(optarg, "csv", 3) == 0) {
-            add_csv_output(arg_param(optarg), determine_csv_fields(devices, num_r_devices));
-        } else if (strncmp(optarg, "kv", 2) == 0) {
-            add_kv_output(arg_param(optarg));
-        } else {
+            case 'q':
+                quiet_mode = 1;
+                break;
+            case 'F':
+                if (strncmp(optarg, "json", 4) == 0) {
+                    add_json_output(arg_param(optarg));
+                } else if (strncmp(optarg, "csv", 3) == 0) {
+                    add_csv_output(arg_param(optarg), determine_csv_fields(devices, num_r_devices));
+                } else if (strncmp(optarg, "kv", 2) == 0) {
+                    add_kv_output(arg_param(optarg));
+                } else {
                     fprintf(stderr, "Invalid output format %s\n", optarg);
                     usage(devices);
-        }
-        break;
-        case 'C':
-        if (strcmp(optarg, "native") == 0) {
-            conversion_mode = CONVERT_NATIVE;
-        } else if (strcmp(optarg, "si") == 0) {
-            conversion_mode = CONVERT_SI;
-        } else if (strcmp(optarg, "customary") == 0) {
-            conversion_mode = CONVERT_CUSTOMARY;
-        } else {
+                }
+                break;
+            case 'C':
+                if (strcmp(optarg, "native") == 0) {
+                    conversion_mode = CONVERT_NATIVE;
+                } else if (strcmp(optarg, "si") == 0) {
+                    conversion_mode = CONVERT_SI;
+                } else if (strcmp(optarg, "customary") == 0) {
+                    conversion_mode = CONVERT_CUSTOMARY;
+                } else {
                     fprintf(stderr, "Invalid conversion mode %s\n", optarg);
                     usage(devices);
-        }
-        break;
-        case 'U':
-        #if !defined(__MINGW32__)
-          utc_mode = setenv("TZ", "UTC", 1);
-          if(utc_mode != 0) fprintf(stderr, "Unable to set TZ to UTC; error code: %d\n", utc_mode);
-        #endif
-        break;
+                }
+                break;
+            case 'U':
+#if !defined(__MINGW32__)
+                utc_mode = setenv("TZ", "UTC", 1);
+                if(utc_mode != 0) fprintf(stderr, "Unable to set TZ to UTC; error code: %d\n", utc_mode);
+#endif
+                break;
             case 'W':
-            overwrite_mode = 1;
-        break;
-        case 'T':
-          time(&stop_time);
-          duration = atoi(optarg);
-          if (duration < 1) {
-            fprintf(stderr, "Duration '%s' was not positive integer; will continue indefinitely\n", optarg);
-          } else {
-            stop_time += duration;
-          }
-          break;
+                overwrite_mode = 1;
+                break;
+            case 'T':
+                time(&stop_time);
+                duration = atoi(optarg);
+                if (duration < 1) {
+                    fprintf(stderr, "Duration '%s' was not positive integer; will continue indefinitely\n", optarg);
+                } else {
+                    stop_time += duration;
+                }
+                break;
             case 'y':
                 test_data = optarg;
+                break;
+            case 'E':
+                stop_after_successful_events_flag = 1;
                 break;
             default:
                 usage(devices);
@@ -1088,27 +1109,43 @@ int main(int argc, char **argv) {
     device_count = rtlsdr_get_device_count();
     if (!device_count) {
         fprintf(stderr, "No supported devices found.\n");
-        if (!in_filename)
         exit(1);
     }
 
-    if (!quiet_mode) {
-        fprintf(stderr, "Found %d device(s):\n", device_count);
-        for (i = 0; i < device_count; i++) {
-        rtlsdr_get_device_usb_strings(i, vendor, product, serial);
-        fprintf(stderr, "  %d:  %s, %s, SN: %s\n", i, vendor, product, serial);
+    if (!quiet_mode) fprintf(stderr, "Found %d device(s)\n\n", device_count);
+
+    if (have_opt_i) {
+        dev_index = rtlsdr_get_index_by_serial(dev_serial_number);
+        if(dev_index < 0) {
+            if(!quiet_mode) fprintf(stderr, "Could not find device with serial #:%s (err %d)",
+                                    dev_serial_number, dev_index);
+            exit(1);
         }
-        fprintf(stderr, "\n");
-
-        fprintf(stderr, "Using device %d: %s\n",
-            dev_index, rtlsdr_get_device_name(dev_index));
     }
+    for (i = device_specified ? dev_index : 0;
+         //cast quiets -Wsign-compare; if dev_index were < 0, would have exited above
+         i < (device_specified ? (unsigned)dev_index + 1 : device_count);
+         i++) {
+        rtlsdr_get_device_usb_strings(i, vendor, product, serial);
 
-    r = rtlsdr_open(&dev, dev_index);
-    if (r < 0) {
-        fprintf(stderr, "Failed to open rtlsdr device #%d.\n", dev_index);
+        if (!quiet_mode) fprintf(stderr, "trying device  %d:  %s, %s, SN: %s\n",
+                                 i, vendor, product, serial);
+
+        r = rtlsdr_open(&dev, i);
+        if (r < 0) {
+            if (!quiet_mode) fprintf(stderr, "Failed to open rtlsdr device #%d.\n\n",
+                                     i);
+        } else {
+            if (!quiet_mode) fprintf(stderr, "Using device %d: %s\n",
+                                     i, rtlsdr_get_device_name(i));
+            break;
+        }
+    }
+    if(r < 0) {
+        if(!quiet_mode) fprintf(stderr, "Unable to open a device\n");
         exit(1);
     }
+
 #ifndef _WIN32
     sigact.sa_handler = sighandler;
     sigemptyset(&sigact.sa_mask);

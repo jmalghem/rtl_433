@@ -97,8 +97,9 @@
 		DECL(infactory) \
 		DECL(ft004b) \
 		DECL(fordremote) \
-		DECL(philips)
-
+		DECL(philips) \
+		DECL(schrader_EG53MA4) \
+		DECL(nexa)
 
 typedef struct {
 	char name[256];
